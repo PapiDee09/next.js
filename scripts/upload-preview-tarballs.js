@@ -1,5 +1,5 @@
 // @ts-check
-const { put } = require('@vercel/blob/client')
+const { presignUrl } = require('@vercel/blob')
 const fs = require('node:fs/promises')
 const path = require('node:path')
 
@@ -129,10 +129,10 @@ async function main() {
   for await (const { packageName, tarballPath } of findTarballs(
     tarballDirectory
   )) {
-    // vercel-packages authorizes the OIDC token and answers with a client
-    // token scoped to this exact blob path. The bytes then flow directly to
-    // the store, so the tarball size is not limited by a function's request
-    // body limit.
+    // vercel-packages authorizes the OIDC token and answers with signed-token
+    // material scoped to this exact blob path. The upload URL is presigned
+    // locally with it and the bytes flow directly to the store, so the tarball
+    // size is not limited by a function's request body limit.
     const response = await fetch(
       `${baseUrl}/commits/${githubHeadSha}/${packageName}`,
       {
@@ -146,20 +146,31 @@ async function main() {
           `Response headers: ${JSON.stringify(Object.fromEntries(response.headers))}`
       )
     }
-    const { clientToken } = await response.json()
+    const signedToken = await response.json()
 
+    const pathname = `next/commits/${githubHeadSha}/${packageName}.tgz`
+    const { presignedUrl } = await presignUrl(signedToken, {
+      operation: 'put',
+      pathname,
+      access: blobAccess,
+      // Re-runs of the upload workflow re-upload the same commit.
+      allowOverwrite: true,
+      // Tarballs must land at the exact path the read routes use.
+      addRandomSuffix: false,
+    })
     const fileBuffer = await fs.readFile(tarballPath)
-    const { url } = await put(
-      `next/commits/${githubHeadSha}/${packageName}.tgz`,
-      fileBuffer,
-      {
-        access: blobAccess,
-        token: clientToken,
-        contentType: 'application/gzip',
-        multipart: true,
-      }
-    )
-    console.info(`Uploaded ${packageName} -> ${url}`)
+    const putResponse = await fetch(presignedUrl, {
+      method: 'PUT',
+      body: new Uint8Array(fileBuffer),
+      headers: { 'content-type': 'application/gzip' },
+    })
+    if (!putResponse.ok) {
+      throw new Error(
+        `Failed to upload ${packageName}: ${putResponse.status}. ` +
+          `Response headers: ${JSON.stringify(Object.fromEntries(putResponse.headers))}`
+      )
+    }
+    console.info(`Uploaded ${packageName} -> ${pathname}`)
   }
 
   console.info('All tarballs uploaded')
