@@ -550,15 +550,55 @@ impl Storage {
         self.map.shards().len()
     }
 
+    /// Iterates the non-transient tasks of a **single** shard of the resident map by index, under
+    /// that shard's read lock.
+    fn for_each_resident_persistent_in_shard(
+        &self,
+        index: usize,
+        mut f: impl FnMut(TaskId, &TaskStorage),
+    ) {
+        let shard = self.map.shards()[index].read();
+        for (task_id, task) in shard.iter() {
+            if task_id.is_transient() {
+                continue;
+            }
+            f(*task_id, task);
+        }
+    }
+
     /// Scans a **single** shard by index, invoking `on_candidate` for each resident, non-transient
     /// task whose storage passes the cheap [`TaskStorage::gc_maybe_collectible`] pre-filter.
     pub fn gc_scan_shard(&self, index: usize, mut on_candidate: impl FnMut(TaskId)) {
-        let shard = self.map.shards()[index].read();
-        for (task_id, task) in shard.iter() {
-            if !task_id.is_transient() && task.gc_maybe_collectible() {
-                on_candidate(*task_id);
+        self.for_each_resident_persistent_in_shard(index, |task_id, storage| {
+            if storage.gc_maybe_collectible() {
+                on_candidate(task_id);
             }
-        }
+        });
+    }
+
+    /// Scans the whole resident map for **GC roots** ([`TaskStorage::gc_is_root`]): parent-less
+    /// tasks that are pinned for some reason — the pinned `ProjectContainer` op, a live endpoint,
+    /// an active task, or one still holding aggregation edges. GC uses them to maintain the
+    /// persisted roots map (mark still-pinned roots live / age out orphans).
+    ///
+    /// Separate from [`Self::gc_scan_shard_candidates`] because the two run in **different phases**
+    /// of a pass: candidates seed the collect pool one shard at a time, whereas roots are
+    /// classified in one shot *after* that pool drains — root-ness reads `upper`/`followers`,
+    /// which a running cascade is still moving around.
+    ///
+    /// Sees only resident tasks; disk-only roots ride the carried-forward roots map instead.
+    pub fn gc_scan_roots(&self) -> Vec<TaskId> {
+        let per_shard: Vec<Vec<TaskId>> =
+            parallel::map_collect(&(0..self.shard_count()).collect::<Vec<_>>(), |&index| {
+                let mut roots = Vec::new();
+                self.for_each_resident_persistent_in_shard(index, |task_id, storage| {
+                    if storage.gc_is_root() {
+                        roots.push(task_id);
+                    }
+                });
+                roots
+            });
+        per_shard.into_iter().flatten().collect()
     }
 
     pub fn access_pair_mut(

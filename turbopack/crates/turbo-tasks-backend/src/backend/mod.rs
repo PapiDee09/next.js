@@ -16,13 +16,14 @@ use std::{
     pin::Pin,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::SystemTime,
 };
 
 use anyhow::{Context, Result, bail};
 use auto_hash_map::{AutoMap, AutoSet};
+pub use gc::TtlCounter;
 use hashbrown::hash_table::Entry;
 use indexmap::IndexSet;
 use parking_lot::Mutex;
@@ -67,8 +68,8 @@ use crate::{
             AggregationUpdateJob, AggregationUpdateQueue, ChildExecuteContext,
             CleanupOldEdgesOperation, ConnectChildOperation, ExecuteContext, ExecuteContextImpl,
             LeafDistanceUpdateQueue, Operation, OutdatedEdge, TaskGuard, TaskType, TaskTypeRef,
-            connect_children, get_aggregation_number, get_uppers, make_task_dirty_internal,
-            prepare_new_children,
+            capture_all_outgoing_edges, connect_children, get_aggregation_number, get_uppers,
+            make_task_dirty_internal, prepare_new_children,
         },
         snapshot_coordinator::{OperationGuard, SnapshotCoordinator},
         storage::Storage,
@@ -92,6 +93,14 @@ use crate::{
 /// If the number of dependent tasks exceeds this threshold,
 /// the operation will be parallelized.
 const DEPENDENT_TASKS_DIRTY_PARALLELIZATION_THRESHOLD: usize = 10000;
+
+/// Whether the reference-counting GC is enabled for this process, from `TURBO_ENGINE_GC`.
+///
+/// Deliberately ignores `BackendOptions::gc`, which is tests-only.
+fn gc_enabled_from_env() -> bool {
+    std::env::var_os("TURBO_ENGINE_GC")
+        .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")))
+}
 
 /// Priority used to re-schedule a task that became stale during execution.
 ///
@@ -146,8 +155,11 @@ pub struct BackendOptions {
 
     /// Strategy for evicting evictable tasks from in-memory storage after a snapshot.
     /// This reclaims memory by clearing persisted data that can be re-loaded from disk on demand.
-    /// This is an EXPERIMENTAL FEATURE under development
     pub eviction_mode: EvictionMode,
+
+    /// Overrides whether the reference-counting GC runs for this backend. `None` (default) derives
+    /// it from the `TURBO_ENGINE_GC` env var;
+    pub gc: Option<bool>,
 }
 
 impl Default for BackendOptions {
@@ -159,6 +171,7 @@ impl Default for BackendOptions {
             num_workers: None,
             small_preallocation: false,
             eviction_mode: EvictionMode::Off,
+            gc: None,
         }
     }
 }
@@ -229,6 +242,25 @@ pub struct TurboTasksBackend {
 
     backing_storage: TurboBackingStorage,
 
+    /// Test-only override of the GC root TTL, in milliseconds; `u64::MAX` means "unset" (use
+    /// [`GC_ROOT_TTL`] / the `TURBO_ENGINE_GC_ROOT_TTL_MS` env). A per-backend field rather than
+    /// the process-global env so parallel tests don't race each other. See
+    /// `set_gc_root_ttl_for_testing`.
+    gc_root_ttl_override_ms: AtomicU64,
+
+    /// `true` until the first GC pass of this session runs. Only that pass may demote a live root
+    /// to `TtlCounter::FirstStale` — GC runs many times per session (on the snapshot cadence), and
+    /// a single pass can easily miss a root that is still live (evicted, or not yet re-requested).
+    /// Demoting on every pass would make the TTL measure idleness within a session rather than
+    /// "was not live in a whole session". See `gc_roots_refresh_and_age_out`.
+    first_gc_pass_of_session: AtomicBool,
+
+    /// Test-only: number of GC passes that produced a roots map to write (i.e. did *not* skip the
+    /// `GcRoots` rewrite because the set was unchanged). Lets a test assert the skip actually
+    /// happens — comparing the persisted set can't, since an unchanged set looks identical whether
+    /// it was rewritten or not. See `gc_roots_writes_for_testing`.
+    gc_roots_writes: AtomicU64,
+
     #[cfg(feature = "verify_aggregation_graph")]
     root_tasks: Mutex<FxHashSet<TaskId>>,
 }
@@ -253,15 +285,14 @@ impl TurboTasksBackend {
             .next_free_task_id()
             .expect("Failed to get task id");
 
-        let mut gc_enabled = std::env::var_os("TURBO_ENGINE_GC")
-            .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")));
+        let mut gc_enabled = options.gc.unwrap_or_else(gc_enabled_from_env);
         if gc_enabled
             && matches!(options.storage_mode, Some(StorageMode::ReadWrite))
             && options.eviction_mode == EvictionMode::Off
         {
             eprintln!(
-                "warning: TURBO_ENGINE_GC is set but eviction is disabled on a ReadWrite backend; \
-                 GC would leave collected tasks resident forever. Forcing GC off. Enable eviction \
+                "warning: GC is enabled but eviction is disabled on a ReadWrite backend; GC would \
+                 leave collected tasks resident forever. Forcing GC off. Enable eviction \
                  ('auto'/'full') to use GC in this mode."
             );
             gc_enabled = false;
@@ -290,6 +321,9 @@ impl TurboTasksBackend {
             is_idle: AtomicBool::new(false),
             task_statistics: TaskStatisticsApi::default(),
             backing_storage,
+            gc_root_ttl_override_ms: AtomicU64::new(u64::MAX),
+            first_gc_pass_of_session: AtomicBool::new(true),
+            gc_roots_writes: AtomicU64::new(0),
             #[cfg(feature = "verify_aggregation_graph")]
             root_tasks: Default::default(),
         }
@@ -375,8 +409,34 @@ impl TurboTasksBackend {
             .unwrap_or(0)
     }
 
-    /// Opens `task` with the must-exist [`ExecuteContext::task`] and drops the guard. Test-only
-    /// hook to exercise the non-fabricating existence guarantee: this panics if `task` exists in
+    /// Override the GC root TTL for this backend (milliseconds). `0` ages out any un-anchored root
+    /// on the next GC pass. Per-backend, so parallel tests don't race the global env.
+    /// Test-only.
+    #[doc(hidden)]
+    pub fn set_gc_root_ttl_for_testing(&self, ttl_ms: u64) {
+        self.gc_root_ttl_override_ms
+            .store(ttl_ms, Ordering::Relaxed);
+    }
+
+    /// Number of GC passes so far that produced a roots map to persist. A pass whose root set was
+    /// unchanged does not increment this — that is the skip. Counted inside `gc_collect`, so it
+    /// covers `gc_for_testing` as well as the production snapshot path. Test-only.
+    #[doc(hidden)]
+    pub fn gc_roots_writes_for_testing(&self) -> u64 {
+        self.gc_roots_writes.load(Ordering::Relaxed)
+    }
+
+    /// The GC roots set as currently persisted on disk (task id -> [`TtlCounter`]). Reads the
+    /// `GcRoots` infra key directly, so it reflects the last committed snapshot — not any in-flight
+    /// pass. Test-only hook for asserting that a root seeded for collection but *not* collected
+    /// stays tracked (see `gc_roots_refresh_and_age_out`'s monotonicity note).
+    #[doc(hidden)]
+    pub fn persisted_gc_roots_for_testing(&self) -> Vec<(TaskId, TtlCounter)> {
+        self.backing_storage.roots().unwrap_or_default()
+    }
+
+    /// Opens `task` with must-exist access and drops the guard. Test-only hook to exercise
+    /// the non-fabricating existence guarantee: this panics (debug builds) if `task` exists in
     /// neither memory nor persistent storage (rather than fabricating a blank).
     #[doc(hidden)]
     pub fn assert_task_exists_for_testing(
@@ -1054,18 +1114,19 @@ impl TurboTasksBackend {
 
         // Hand the GC pass's exclusion straight to the snapshot (`into_snapshot`) so the collected
         // tasks' tombstones (derived from the `deleted` flag) ride this same commit.
+        let mut gc_roots_to_persist: Option<Vec<(TaskId, TtlCounter)>> = None;
         let mut snapshot_phase = if self.gc_enabled {
             let gc_span = tracing::info_span!(
                 parent: parent_span.clone(),
                 "gc",
                 stats = tracing::field::Empty,
-                edges_deleted = tracing::field::Empty,
             )
             .entered();
             let gc_phase = self.snapshot_coord.begin_gc();
-            let stats = self.gc_collect(turbo_tasks);
+            let (stats, roots) = self.gc_collect(turbo_tasks);
             gc_span.record("stats", display(stats));
-            // transition into snapshot modeatomically
+            gc_roots_to_persist = roots;
+            // transition into snapshot mode atomically
             gc_phase.into_snapshot()
         } else {
             self.snapshot_coord.begin_snapshot()
@@ -1085,7 +1146,7 @@ impl TurboTasksBackend {
         let snapshot_time = Instant::now();
         drop(snapshot_phase);
 
-        if !has_modifications {
+        if !has_modifications && gc_roots_to_persist.is_none() {
             // No tasks modified since the last snapshot — drop the guard (which
             // calls end_snapshot) and skip the expensive O(N) scan.
             drop(snapshot_guard);
@@ -1366,9 +1427,10 @@ impl TurboTasksBackend {
         let snapshot_duration = start.elapsed();
         let task_count = task_snapshots.len();
 
-        if task_snapshots.is_empty() {
-            // This should be impossible — if we got here, modified_count was nonzero, and every
-            // modification that increments the count also failed during encoding.
+        if task_snapshots.is_empty() && gc_roots_to_persist.is_none() {
+            // This should be impossible — if we got here, modified_count was nonzero or gc_roots
+            // was present, and every modification that increments the count also failed
+            // during encoding.
             std::hint::cold_path();
             return Ok((snapshot_time, false));
         }
@@ -1384,9 +1446,11 @@ impl TurboTasksBackend {
         // Tasks were already consumed by take_snapshot, so a future snapshot
         // would not re-persist them — returning an error signals to the caller
         // that further persist attempts would corrupt the task graph in storage.
-        let snapshot_meta = self
-            .backing_storage
-            .save_snapshot(suspended_operations, task_snapshots)?;
+        let snapshot_meta = self.backing_storage.save_snapshot(
+            suspended_operations,
+            gc_roots_to_persist,
+            task_snapshots,
+        )?;
         span.record("snapshot_meta", display(snapshot_meta));
 
         #[cfg(feature = "print_cache_item_size")]
@@ -3355,6 +3419,12 @@ impl TurboTasksBackend {
     }
 
     fn dispose_root_task(&self, task_id: TaskId, turbo_tasks: &TurboTasks<TurboTasksBackend>) {
+        // Once stopping, it is too late to tear down tasks safely
+        // This represents a leak! but the root age out system will save us.
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+
         #[cfg(feature = "verify_aggregation_graph")]
         self.root_tasks.lock().remove(&task_id);
 
@@ -3368,10 +3438,23 @@ impl TurboTasksBackend {
                 activeness_state.unset_root_type();
                 activeness_state.set_active_until_clean();
             };
-        } else if let Some(activeness_state) = task.take_activeness() {
-            // Technically nobody should be listening to this event, but just in case
-            // we notify it anyway
-            activeness_state.all_clean_event.notify(usize::MAX);
+        } else {
+            if let Some(activeness_state) = task.take_activeness() {
+                // Technically nobody should be listening to this event, but just in case
+                // we notify it anyway
+                activeness_state.all_clean_event.notify(usize::MAX);
+            }
+            let old_edges = capture_all_outgoing_edges(&task);
+            drop(task);
+
+            if !old_edges.is_empty() {
+                CleanupOldEdgesOperation::run(
+                    task_id,
+                    old_edges,
+                    AggregationUpdateQueue::new(),
+                    &mut ctx,
+                );
+            }
         }
     }
 
